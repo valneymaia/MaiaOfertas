@@ -382,27 +382,63 @@ def get_product_metadata_browser_sync(product_url):
                 'img[src*="mlstatic.com"]',
                 'meta[property="og:image"]',
             ]
+            # Coleta múltiplos candidatos e aplica heurística de pontuação
+            candidates = []
             for selector in image_selectors:
-                locator = page.locator(selector).first
-                if locator.count() == 0:
+                locator = page.locator(selector)
+                count = locator.count()
+                if count == 0:
                     continue
 
-                if selector.startswith("meta"):
-                    candidate = locator.get_attribute("content")
-                else:
-                    candidate = (
-                        locator.get_attribute("data-zoom")
-                        or locator.get_attribute("src")
-                        or locator.get_attribute("data-src")
-                    )
-                    srcset = locator.get_attribute("srcset")
-                    if not candidate and srcset:
-                        candidate = srcset.split(",")[-1].strip().split(" ")[0]
+                for i in range(count):
+                    el = locator.nth(i)
+                    try:
+                        if selector.startswith("meta"):
+                            candidate = el.get_attribute("content")
+                            score = 200
+                        else:
+                            candidate = (
+                                el.get_attribute("data-zoom")
+                                or el.get_attribute("src")
+                                or el.get_attribute("data-src")
+                                or ""
+                            )
+                            srcset = el.get_attribute("srcset")
+                            if not candidate and srcset:
+                                candidate = srcset.split(",")[-1].strip().split(" ")[0]
 
-                candidate = normalize_image_url(candidate)
-                if candidate and "mlstatic.com" in candidate and "logo" not in candidate.lower():
-                    image_url = candidate
-                    break
+                            score = 0
+                            if candidate and "mlstatic.com" in candidate:
+                                score += 50
+                            if el.get_attribute("data-zoom") or el.get_attribute("data-image"):
+                                score += 25
+
+                            # verifica classes de elementos pais para priorizar galeria/pdp
+                            try:
+                                parent_classes = el.evaluate("el => { let p = el.closest('[class]'); return p ? p.className : ''; }")
+                            except Exception:
+                                parent_classes = ""
+                            if parent_classes and any(k in parent_classes.lower() for k in ("gallery", "pdp", "ui-pdp", "product", "picture", "image", "thumbnail")):
+                                score += 20
+
+                            # penaliza avatares, logos e imagens de usuário/vendedor
+                            cand_low = (candidate or "").lower()
+                            if any(b in cand_low for b in ("logo", "avatar", "profile", "thumb", "seller", "user", "avatar")):
+                                score -= 200
+
+                        candidate = normalize_image_url(candidate)
+                        candidates.append((score, candidate))
+                    except Exception:
+                        continue
+
+            # Escolhe o candidato com maior pontuação válido
+            if candidates:
+                candidates = [c for c in candidates if c[1]]
+                if candidates:
+                    candidates.sort(reverse=True, key=lambda x: x[0])
+                    best = candidates[0][1]
+                    if best and "logo" not in best.lower():
+                        image_url = best
 
             if title:
                 print(f"[MLM] Titulo do produto via navegador: {title}")
@@ -656,8 +692,33 @@ async def build_ml_affiliate_result(url):
 
     if "SOCIAL_PROFILE" in type_url:
         print(f"[ML ] API ML gerou link social afiliado: {result_url}")
-
+    # Primeiro tenta pegar metadata do produto limpo
     metadata = await fetch_product_metadata(product_url)
+
+    # Se não encontrou imagem, tenta a partir da URL de afiliado (às vezes o short/aff link contém as meta tags)
+    if not metadata.get("image_url"):
+        try:
+            print(f"[MLC] Imagem nao encontrada no produto; tentando meta em affiliate URL: {result_url}")
+            affiliate_meta = await fetch_product_metadata(result_url)
+            if affiliate_meta.get("image_url"):
+                print("[MLC] Encontrou imagem via affiliate URL meta tag.")
+                metadata = affiliate_meta
+        except Exception as e:
+            print(f"[MLC] Erro ao tentar metadata do affiliate URL: {e}")
+
+    # Se ainda nao encontrou, tenta a origem retornada pela API
+    if not metadata.get("image_url"):
+        origin_url = get_ml_origin_url(item)
+        if origin_url:
+            try:
+                print(f"[MLC] Tentando meta na origin_url retornada pela API: {origin_url}")
+                origin_meta = await fetch_product_metadata(origin_url)
+                if origin_meta.get("image_url"):
+                    print("[MLC] Encontrou imagem via origin_url meta tag.")
+                    metadata = origin_meta
+            except Exception as e:
+                print(f"[MLC] Erro ao tentar metadata da origin_url: {e}")
+
     return {
         "affiliate_url": result_url,
         "product_url": product_url,
