@@ -1,4 +1,6 @@
 import asyncio
+import html
+import io
 import re
 import httpx
 from urllib.parse import urlparse, urlencode, parse_qs, parse_qsl, urlunparse, urlsplit, urlunsplit
@@ -16,6 +18,32 @@ from config import (
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
 URL_REGEX = re.compile(r'https?://\S+')
+PROMO_LINK_DOMAINS = (
+    "t.me",
+    "telegram.me",
+    "linktr.ee",
+    "bit.ly",
+    "cutt.ly",
+    "tinyurl.com",
+    "chat.whatsapp.com",
+    "whatsapp.com",
+    "wa.me",
+)
+PROMO_TEXT_MARKERS = (
+    "todos nossos grupos",
+    "todos os nossos grupos",
+    "grupo de ofertas",
+    "grupos de ofertas",
+    "canal de ofertas",
+    "canal do whatsapp",
+    "canal whatsapp",
+    "clique aqui e entre",
+    "entre no grupo",
+    "link dos grupos",
+    "links dos grupos",
+    "grupo do whatsapp",
+    "whatsapp",
+)
 ML_PRODUCT_REGEX = re.compile(
     r'https?:\\?/\\?/www\.mercadolivre\.com\.br\\?/[^"\'>\s]+'
     r'(?:/(?:p|up)/MLB[A-Z0-9]+|/MLB-\d+|item_id%3AMLB\d+|item_id=MLB\d+)'
@@ -24,6 +52,7 @@ ML_PRODUCT_REGEX = re.compile(
 ML_DOMAINS     = ("mercadolivre.com", "mercadolibre.com", "ml.com.br", "meli.la")
 AMAZON_DOMAINS = ("amazon.com.br", "amazon.com", "amzn.to", "amzn.com")
 ML_CREATE_LINK_URL = "https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink"
+ML_MEDIA_TIMEOUT = 15
 ML_BAD_PARAMS = {
     "matt_tool",
     "matt_word",
@@ -50,6 +79,67 @@ def is_ml(url):
 
 def is_amazon(url):
     return any(d in url for d in AMAZON_DOMAINS)
+
+def is_promo_group_url(url):
+    parsed = urlsplit(url)
+    host = parsed.netloc.lower()
+    return any(domain in host for domain in PROMO_LINK_DOMAINS)
+
+def is_promo_group_line(line):
+    normalized = line.strip().lower()
+    if not normalized:
+        return False
+    if any(marker in normalized for marker in PROMO_TEXT_MARKERS):
+        return True
+    urls = URL_REGEX.findall(line)
+    return bool(urls) and all(is_promo_group_url(url.strip(".,)\"'")) for url in urls)
+
+def remove_promo_urls_from_line(line):
+    removed = False
+
+    def replace_url(match):
+        nonlocal removed
+        url = match.group(0).strip(".,)\"'")
+        if is_promo_group_url(url):
+            removed = True
+            return ""
+        return match.group(0)
+
+    cleaned = URL_REGEX.sub(replace_url, line)
+    cleaned = re.sub(r"[ \t]{2,}", " ", cleaned).strip()
+    return cleaned, removed
+
+def remove_promo_group_blocks(text):
+    cleaned_lines = []
+    removed = False
+    skipping_promo_block = False
+
+    for line in text.splitlines():
+        if is_promo_group_line(line):
+            removed = True
+            skipping_promo_block = True
+            continue
+
+        urls = URL_REGEX.findall(line)
+        only_promo_urls = bool(urls) and all(
+            is_promo_group_url(url.strip(".,)\"'")) for url in urls
+        )
+        if skipping_promo_block and (not line.strip() or only_promo_urls):
+            removed = True
+            continue
+
+        cleaned_line, removed_url = remove_promo_urls_from_line(line)
+        removed = removed or removed_url
+        skipping_promo_block = False
+        if cleaned_line or line.strip() == "":
+            cleaned_lines.append(cleaned_line)
+
+    cleaned_text = "\n".join(cleaned_lines)
+    cleaned_text = re.sub(r"(?im)^\s*[-–—]?\s*(?:\(?an[uú]ncio\)?|#an[uú]ncio|#publi)\s*$", "", cleaned_text)
+    cleaned_text = re.sub(r"\n{3,}", "\n\n", cleaned_text).strip()
+    if removed:
+        print("[MSG] Links/blocos promocionais de grupos removidos.")
+    return cleaned_text
 
 def is_ml_social_url(url):
     return "/social/" in urlsplit(url).path.lower()
@@ -210,6 +300,280 @@ def get_ml_result_url(item):
 def get_ml_origin_url(item):
     return item.get("origin_url") or item.get("originUrl")
 
+def find_meta_content(page_html, property_name):
+    patterns = [
+        rf'<meta[^>]+property=["\']{re.escape(property_name)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']{re.escape(property_name)}["\']',
+        rf'<meta[^>]+name=["\']{re.escape(property_name)}["\'][^>]+content=["\']([^"\']+)["\']',
+        rf'<meta[^>]+content=["\']([^"\']+)["\'][^>]+name=["\']{re.escape(property_name)}["\']',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, page_html, flags=re.IGNORECASE)
+        if match:
+            return html.unescape(match.group(1).strip())
+    return None
+
+def normalize_image_url(image_url):
+    if not image_url:
+        return None
+    image_url = html.unescape(image_url).strip()
+    if image_url.startswith("//"):
+        image_url = "https:" + image_url
+    return image_url
+
+def pick_amazon_dynamic_image(dynamic_image):
+    if not dynamic_image:
+        return None
+
+    matches = re.findall(r'"(https://[^"]+)"\s*:\s*\[\s*(\d+)\s*,\s*(\d+)\s*\]', dynamic_image)
+    if not matches:
+        return None
+
+    best = max(matches, key=lambda item: int(item[1]) * int(item[2]))
+    return normalize_image_url(best[0].replace("\\/", "/"))
+
+def get_product_metadata_browser_sync(product_url):
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=RESOLVE_HEADERS["User-Agent"],
+            locale="pt-BR",
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_selector("h1, img", timeout=12000)
+            except PlaywrightTimeoutError:
+                pass
+
+            title = None
+            title_selectors = [
+                "h1.ui-pdp-title",
+                "h1",
+                'meta[property="og:title"]',
+            ]
+            for selector in title_selectors:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                if selector.startswith("meta"):
+                    title = locator.get_attribute("content")
+                else:
+                    title = locator.inner_text(timeout=3000)
+                if title:
+                    title = html.unescape(title.strip())
+                    break
+
+            image_url = None
+            image_selectors = [
+                'img[data-zoom*="mlstatic.com"]',
+                "img.ui-pdp-image",
+                "img.ui-pdp-gallery__figure__image",
+                'img[src*="D_NQ_NP"]',
+                'img[src*="D_Q_NP"]',
+                'img[src*="http2.mlstatic.com"]',
+                "figure img",
+                'img[src*="mlstatic.com"]',
+                'meta[property="og:image"]',
+            ]
+            for selector in image_selectors:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+
+                if selector.startswith("meta"):
+                    candidate = locator.get_attribute("content")
+                else:
+                    candidate = (
+                        locator.get_attribute("data-zoom")
+                        or locator.get_attribute("src")
+                        or locator.get_attribute("data-src")
+                    )
+                    srcset = locator.get_attribute("srcset")
+                    if not candidate and srcset:
+                        candidate = srcset.split(",")[-1].strip().split(" ")[0]
+
+                candidate = normalize_image_url(candidate)
+                if candidate and "mlstatic.com" in candidate and "logo" not in candidate.lower():
+                    image_url = candidate
+                    break
+
+            if title:
+                print(f"[MLM] Titulo do produto via navegador: {title}")
+            if image_url:
+                print(f"[MLM] Imagem principal via navegador: {image_url}")
+            else:
+                print("[MLM] Navegador nao encontrou imagem principal do produto.")
+
+            return {"title": title, "image_url": image_url}
+        except PlaywrightError as e:
+            print(f"[!] Browser nao conseguiu buscar metadata do produto: {e}")
+            return {}
+        finally:
+            browser.close()
+
+async def fetch_product_metadata_browser(product_url):
+    return await asyncio.to_thread(get_product_metadata_browser_sync, product_url)
+
+def get_amazon_metadata_browser_sync(product_url):
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.sync_api import sync_playwright
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent=RESOLVE_HEADERS["User-Agent"],
+            locale="pt-BR",
+        )
+        page = context.new_page()
+
+        try:
+            page.goto(product_url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                page.wait_for_selector("#productTitle, #landingImage, img", timeout=12000)
+            except PlaywrightTimeoutError:
+                pass
+
+            title = None
+            for selector in ["#productTitle", "span#productTitle", 'meta[property="og:title"]']:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+                if selector.startswith("meta"):
+                    title = locator.get_attribute("content")
+                else:
+                    title = locator.inner_text(timeout=3000)
+                if title:
+                    title = html.unescape(" ".join(title.split()))
+                    break
+
+            image_url = None
+            image_selectors = [
+                "#landingImage",
+                "#imgTagWrapperId img",
+                "#main-image-container img",
+                'img[data-old-hires*="media-amazon.com"]',
+                'img[src*="media-amazon.com"]',
+                'meta[property="og:image"]',
+            ]
+            for selector in image_selectors:
+                locator = page.locator(selector).first
+                if locator.count() == 0:
+                    continue
+
+                if selector.startswith("meta"):
+                    candidate = locator.get_attribute("content")
+                else:
+                    candidate = (
+                        pick_amazon_dynamic_image(locator.get_attribute("data-a-dynamic-image"))
+                        or locator.get_attribute("data-old-hires")
+                        or locator.get_attribute("src")
+                        or locator.get_attribute("data-src")
+                    )
+
+                candidate = normalize_image_url(candidate)
+                if candidate and "media-amazon.com" in candidate:
+                    image_url = candidate
+                    break
+
+            if title:
+                print(f"[AMZ] Titulo do produto via navegador: {title}")
+            if image_url:
+                print(f"[AMZ] Imagem principal via navegador: {image_url}")
+            else:
+                print("[AMZ] Navegador nao encontrou imagem principal do produto.")
+
+            return {"title": title, "image_url": image_url}
+        except PlaywrightError as e:
+            print(f"[!] Browser nao conseguiu buscar metadata Amazon: {e}")
+            return {}
+        finally:
+            browser.close()
+
+async def fetch_amazon_metadata(product_url):
+    metadata = await asyncio.to_thread(get_amazon_metadata_browser_sync, product_url)
+    if metadata.get("image_url"):
+        return metadata
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=ML_MEDIA_TIMEOUT,
+            headers=RESOLVE_HEADERS,
+        ) as http:
+            response = await http.get(product_url)
+            response.raise_for_status()
+            page_html = response.text
+    except Exception as e:
+        print(f"[!] Nao consegui buscar metadata Amazon: {e}")
+        return metadata
+
+    title = metadata.get("title") or find_meta_content(page_html, "og:title")
+    image_url = normalize_image_url(find_meta_content(page_html, "og:image"))
+    if image_url:
+        print(f"[AMZ] Imagem Amazon via meta tag: {image_url}")
+    return {"title": title, "image_url": image_url}
+
+async def fetch_product_metadata(product_url):
+    browser_metadata = await fetch_product_metadata_browser(product_url)
+    if browser_metadata.get("image_url"):
+        return browser_metadata
+
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=ML_MEDIA_TIMEOUT,
+            headers=RESOLVE_HEADERS,
+        ) as http:
+            response = await http.get(product_url)
+            response.raise_for_status()
+            page_html = response.text
+    except Exception as e:
+        print(f"[!] Nao consegui buscar metadata do produto: {e}")
+        return {}
+
+    title = (
+        browser_metadata.get("title")
+        or find_meta_content(page_html, "og:title")
+        or find_meta_content(page_html, "twitter:title")
+    )
+    image_url = (
+        find_meta_content(page_html, "og:image")
+        or find_meta_content(page_html, "twitter:image")
+    )
+    image_url = normalize_image_url(image_url)
+
+    if title:
+        print(f"[MLM] Titulo do produto: {title}")
+    if image_url:
+        print(f"[MLM] Imagem do produto: {image_url}")
+
+    return {"title": title, "image_url": image_url}
+
+async def download_image_file(image_url):
+    try:
+        async with httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=ML_MEDIA_TIMEOUT,
+            headers=RESOLVE_HEADERS,
+        ) as http:
+            response = await http.get(image_url)
+            response.raise_for_status()
+    except Exception as e:
+        print(f"[!] Nao consegui baixar imagem do produto: {e}")
+        return None
+
+    image_file = io.BytesIO(response.content)
+    image_file.name = "produto.jpg"
+    return image_file
+
 async def create_ml_link_once(url):
     if not ML_AFFILIATE_WORD:
         print("[!!] Configure ML_AFFILIATE_WORD no .env.")
@@ -270,6 +634,10 @@ async def convert_ml_affiliate_to_product_url(url):
     return product_url
 
 async def inject_ml_affiliate(url):
+    result = await build_ml_affiliate_result(url)
+    return result["affiliate_url"] if result else None
+
+async def build_ml_affiliate_result(url):
     product_url = await convert_ml_affiliate_to_product_url(url)
     if not product_url:
         return None
@@ -289,7 +657,12 @@ async def inject_ml_affiliate(url):
     if "SOCIAL_PROFILE" in type_url:
         print(f"[ML ] API ML gerou link social afiliado: {result_url}")
 
-    return result_url
+    metadata = await fetch_product_metadata(product_url)
+    return {
+        "affiliate_url": result_url,
+        "product_url": product_url,
+        "metadata": metadata,
+    }
 
 async def inject_amazon_affiliate(url):
     if "amzn.to" in url or "amzn.com" in url:
@@ -301,33 +674,57 @@ async def inject_amazon_affiliate(url):
     new_query = urlencode({k: v[0] for k, v in params.items()})
     return urlunparse(parsed._replace(query=new_query))
 
+async def build_amazon_affiliate_result(url):
+    affiliate_url = await inject_amazon_affiliate(url)
+    metadata = await fetch_amazon_metadata(affiliate_url)
+    return {
+        "affiliate_url": affiliate_url,
+        "metadata": metadata,
+    }
+
 async def process_message(text):
+    text = remove_promo_group_blocks(text)
     urls = URL_REGEX.findall(text)
     if not urls:
         return None
     modified = text
     found = False
+    media = {"link_preview": True}
     for raw_url in urls:
         url = raw_url.strip(".,)\"'")
         print(f"[URL] {url}")
         resolved = await resolve_redirect(url)
         print(f"[RES] {resolved}")
         if is_ml(resolved):
-            new_url = await inject_ml_affiliate(resolved)
-            if new_url:
+            ml_result = await build_ml_affiliate_result(resolved)
+            if ml_result:
+                new_url = ml_result["affiliate_url"]
                 modified = modified.replace(raw_url, new_url)
                 print(f"[ML ] {new_url}")
+                if not media.get("image_url"):
+                    media = ml_result.get("metadata") or {}
+                    media["link_preview"] = False
                 found = True
             else:
                 print("[~  ] ML nao gerou link afiliado.")
         elif is_amazon(resolved):
-            new_url = await inject_amazon_affiliate(resolved)
-            modified = modified.replace(raw_url, new_url)
-            print(f"[AMZ] {new_url}")
-            found = True
+            amazon_result = await build_amazon_affiliate_result(resolved)
+            if amazon_result:
+                new_url = amazon_result["affiliate_url"]
+                modified = modified.replace(raw_url, new_url)
+                print(f"[AMZ] {new_url}")
+                if not media.get("image_url"):
+                    media = amazon_result.get("metadata") or {}
+                    media["link_preview"] = False
+                found = True
+            else:
+                print("[~  ] Amazon nao gerou link afiliado.")
         else:
             print(f"[~  ] Nao e ML nem Amazon.")
-    return modified if found else None
+    if not found:
+        return None
+
+    return {"text": modified, "media": media}
 
 # IDs resolvidos no startup
 RESOLVED_SOURCE_IDS = set()
@@ -388,8 +785,27 @@ async def handler(event):
         print("[!!] Grupo de destino nao resolvido; nao foi possivel repostar.")
         return
 
+    result_text = result["text"]
+    media = result.get("media") or {}
+    image_url = media.get("image_url")
 
-    await client.send_message(resolved_target, result, link_preview=False)
+    if image_url:
+        image_file = await download_image_file(image_url)
+        if image_file:
+            await client.send_file(
+                resolved_target,
+                image_file,
+                caption=result_text,
+                link_preview=False,
+            )
+            print("[+] Repostado com imagem do produto!")
+            return
+
+    await client.send_message(
+        resolved_target,
+        result_text,
+        link_preview=media.get("link_preview", True),
+    )
     print(f"[+] Repostado!")
 
 if __name__ == "__main__":
