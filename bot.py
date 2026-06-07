@@ -12,8 +12,12 @@ from config import (
     SOURCE_GROUPS, TARGET_GROUP,
     ML_AFFILIATE_ID, ML_AFFILIATE_WORD,
     ML_CREATE_LINK_COOKIE, ML_CSRF_TOKEN,
-    AMAZON_AFFILIATE_TAG
+    AMAZON_AFFILIATE_TAG,
+    SHORTEN_AMAZON,
 )
+from shortener import shorten_url
+from shopee import is_shopee, build_shopee_affiliate_result
+from aliexpress import is_aliexpress, build_aliexpress_affiliate_result
 
 client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
@@ -772,6 +776,8 @@ async def process_message(text):
             amazon_result = await build_amazon_affiliate_result(resolved)
             if amazon_result:
                 new_url = amazon_result["affiliate_url"]
+                if SHORTEN_AMAZON:
+                    new_url = await shorten_url(new_url)
                 modified = modified.replace(raw_url, new_url)
                 print(f"[AMZ] {new_url}")
                 if not media.get("image_url"):
@@ -780,8 +786,32 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] Amazon nao gerou link afiliado.")
+        elif is_shopee(resolved):
+            shopee_result = await build_shopee_affiliate_result(resolved)
+            if shopee_result:
+                new_url = shopee_result["affiliate_url"]
+                modified = modified.replace(raw_url, new_url)
+                print(f"[SHP] {new_url}")
+                if not media.get("image_url"):
+                    media = shopee_result.get("metadata") or {}
+                    media["link_preview"] = False
+                found = True
+            else:
+                print("[~  ] Shopee nao gerou link afiliado.")
+        elif is_aliexpress(resolved):
+            ali_result = await build_aliexpress_affiliate_result(resolved)
+            if ali_result:
+                new_url = ali_result["affiliate_url"]
+                modified = modified.replace(raw_url, new_url)
+                print(f"[ALI] {new_url}")
+                if not media.get("image_url"):
+                    media = ali_result.get("metadata") or {}
+                    media["link_preview"] = False
+                found = True
+            else:
+                print("[~  ] AliExpress nao gerou link afiliado.")
         else:
-            print(f"[~  ] Nao e ML nem Amazon.")
+            print(f"[~  ] Nao e ML, Amazon, Shopee nem AliExpress.")
     if not found:
         return None
 
