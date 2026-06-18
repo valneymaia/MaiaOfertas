@@ -5,7 +5,6 @@ from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl, quote
 
 import httpx
 from config import SHOPEE_AFFILIATE_ID
-from shortener import shorten_url
 
 SHOPEE_DOMAINS = ("shopee.com.br", "s.shopee.com.br", "shp.ee", "shopee.com")
 
@@ -137,7 +136,6 @@ async def build_shopee_affiliate_result(url: str) -> dict | None:
     affiliate_url = build_shopee_affiliate_url(clean_url)
     if not affiliate_url:
         return None
-    short_url = await shorten_url(affiliate_url)
-    print(f"[SHP] Link afiliado: {short_url}")
+    print(f"[SHP] Link afiliado: {affiliate_url}")
     metadata = await fetch_shopee_metadata(clean_url)
-    return {"affiliate_url": short_url, "product_url": clean_url, "metadata": metadata}
+    return {"affiliate_url": affiliate_url, "product_url": clean_url, "metadata": metadata}

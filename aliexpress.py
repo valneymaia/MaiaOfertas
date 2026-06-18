@@ -6,7 +6,6 @@ from urllib.parse import urlsplit, urlunsplit, urlencode, parse_qsl
 
 import httpx
 from config import ALIEXPRESS_APP_KEY, ALIEXPRESS_APP_SECRET, ALIEXPRESS_TRACKING_ID
-from shortener import shorten_url
 
 ALIEXPRESS_DOMAINS = ("aliexpress.com", "s.click.aliexpress.com", "a.aliexpress.com", "ali.ski", "aliexpress.us")
 ALIEXPRESS_BAD_PARAMS = {"aff_fcid", "aff_trace_key", "algo_expid", "algo_pvid", "btsid", "ws_ab_test", "scm"}
@@ -166,7 +165,6 @@ async def build_aliexpress_affiliate_result(url: str) -> dict | None:
     if not affiliate_url:
         print("[ALI] Sem link de afiliado. Repostando sem modificação.")
         return None
-    short_url = await shorten_url(affiliate_url)
-    print(f"[ALI] Link final: {short_url}")
+    print(f"[ALI] Link final: {affiliate_url}")
     metadata = await fetch_aliexpress_metadata(clean_url)
-    return {"affiliate_url": short_url, "product_url": clean_url, "metadata": metadata}
+    return {"affiliate_url": affiliate_url, "product_url": clean_url, "metadata": metadata}

@@ -13,9 +13,7 @@ from config import (
     ML_AFFILIATE_ID, ML_AFFILIATE_WORD,
     ML_CREATE_LINK_COOKIE, ML_CSRF_TOKEN,
     AMAZON_AFFILIATE_TAG,
-    SHORTEN_AMAZON,
 )
-from shortener import shorten_url
 from shopee import is_shopee, build_shopee_affiliate_result
 from aliexpress import is_aliexpress, build_aliexpress_affiliate_result
 
@@ -26,9 +24,6 @@ PROMO_LINK_DOMAINS = (
     "t.me",
     "telegram.me",
     "linktr.ee",
-    "bit.ly",
-    "cutt.ly",
-    "tinyurl.com",
     "chat.whatsapp.com",
     "whatsapp.com",
     "wa.me",
@@ -46,6 +41,10 @@ PROMO_TEXT_MARKERS = (
     "link dos grupos",
     "links dos grupos",
     "grupo do whatsapp",
+    "dar uma moral",
+    "moral no canal",
+    "nosso canal",
+    "nosso grupo",
     "whatsapp",
 )
 ML_PRODUCT_REGEX = re.compile(
@@ -144,6 +143,56 @@ def remove_promo_group_blocks(text):
     if removed:
         print("[MSG] Links/blocos promocionais de grupos removidos.")
     return cleaned_text
+
+def link_label_for_url(url):
+    if is_amazon(url):
+        return "Comprar na Amazon"
+    if is_ml(url):
+        return "Comprar no Mercado Livre"
+    if is_shopee(url):
+        return "Comprar na Shopee"
+    if is_aliexpress(url):
+        return "Comprar no AliExpress"
+    return "Abrir oferta"
+
+def format_plain_text_html(text):
+    escaped = html.escape(text)
+    return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", escaped, flags=re.DOTALL)
+
+def compact_links_for_telegram(text):
+    parts = []
+    last_end = 0
+
+    for match in URL_REGEX.finditer(text):
+        parts.append(format_plain_text_html(text[last_end:match.start()]))
+
+        raw_url = match.group(0)
+        clean_url = raw_url.rstrip(".,)\"'")
+        trailing = raw_url[len(clean_url):]
+        label = html.escape(link_label_for_url(clean_url))
+        href = html.escape(clean_url, quote=True)
+
+        parts.append(f'<a href="{href}">{label}</a>')
+        parts.append(format_plain_text_html(trailing))
+        last_end = match.end()
+
+    parts.append(format_plain_text_html(text[last_end:]))
+    return "".join(parts)
+
+def remove_url_from_text(text, raw_url):
+    cleaned_lines = []
+
+    for line in text.splitlines():
+        line_has_url = raw_url in line
+        modified_line = line.replace(raw_url, "") if line_has_url else line
+        if line_has_url and is_promo_group_line(modified_line):
+            continue
+
+        cleaned_line = re.sub(r"[ \t]{2,}", " ", modified_line).strip()
+        if cleaned_line:
+            cleaned_lines.append(cleaned_line)
+
+    return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
 
 def is_ml_social_url(url):
     return "/social/" in urlsplit(url).path.lower()
@@ -696,6 +745,7 @@ async def build_ml_affiliate_result(url):
 
     if "SOCIAL_PROFILE" in type_url:
         print(f"[ML ] API ML gerou link social afiliado: {result_url}")
+
     # Primeiro tenta pegar metadata do produto limpo
     metadata = await fetch_product_metadata(product_url)
 
@@ -756,6 +806,9 @@ async def process_message(text):
     found = False
     media = {"link_preview": True}
     for raw_url in urls:
+        if raw_url not in modified:
+            continue
+
         url = raw_url.strip(".,)\"'")
         print(f"[URL] {url}")
         resolved = await resolve_redirect(url)
@@ -772,12 +825,11 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] ML nao gerou link afiliado.")
+                modified = remove_url_from_text(modified, raw_url)
         elif is_amazon(resolved):
             amazon_result = await build_amazon_affiliate_result(resolved)
             if amazon_result:
                 new_url = amazon_result["affiliate_url"]
-                if SHORTEN_AMAZON:
-                    new_url = await shorten_url(new_url)
                 modified = modified.replace(raw_url, new_url)
                 print(f"[AMZ] {new_url}")
                 if not media.get("image_url"):
@@ -786,6 +838,7 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] Amazon nao gerou link afiliado.")
+                modified = remove_url_from_text(modified, raw_url)
         elif is_shopee(resolved):
             shopee_result = await build_shopee_affiliate_result(resolved)
             if shopee_result:
@@ -798,6 +851,7 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] Shopee nao gerou link afiliado.")
+                modified = remove_url_from_text(modified, raw_url)
         elif is_aliexpress(resolved):
             ali_result = await build_aliexpress_affiliate_result(resolved)
             if ali_result:
@@ -810,12 +864,14 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] AliExpress nao gerou link afiliado.")
+                modified = remove_url_from_text(modified, raw_url)
         else:
-            print(f"[~  ] Nao e ML, Amazon, Shopee nem AliExpress.")
+            print(f"[~  ] Nao e ML, Amazon, Shopee nem AliExpress. Link removido.")
+            modified = remove_url_from_text(modified, raw_url)
     if not found:
         return None
 
-    return {"text": modified, "media": media}
+    return {"text": compact_links_for_telegram(modified), "media": media}
 
 # IDs resolvidos no startup
 RESOLVED_SOURCE_IDS = set()
@@ -888,6 +944,7 @@ async def handler(event):
                 image_file,
                 caption=result_text,
                 link_preview=False,
+                parse_mode="html",
             )
             print("[+] Repostado com imagem do produto!")
             return
@@ -896,6 +953,7 @@ async def handler(event):
         resolved_target,
         result_text,
         link_preview=media.get("link_preview", True),
+        parse_mode="html",
     )
     print(f"[+] Repostado!")
 

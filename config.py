@@ -28,8 +28,3 @@ SHOPEE_APP_SECRET = os.getenv("SHOPEE_APP_SECRET", "")
 ALIEXPRESS_APP_KEY = os.getenv("ALIEXPRESS_APP_KEY", "")
 ALIEXPRESS_APP_SECRET = os.getenv("ALIEXPRESS_APP_SECRET", "")
 ALIEXPRESS_TRACKING_ID = os.getenv("ALIEXPRESS_TRACKING_ID", "")
-
-# Encurtador
-SHORTEN_AMAZON = os.getenv("SHORTEN_AMAZON", "true").lower() == "true"
-SHORTEN_SHOPEE = os.getenv("SHORTEN_SHOPEE", "true").lower() == "true"
-SHORTEN_ALIEXPRESS = os.getenv("SHORTEN_ALIEXPRESS", "true").lower() == "true"

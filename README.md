@@ -50,7 +50,8 @@ Antes de repostar, o bot remove blocos promocionais de outros grupos, como:
 - links `t.me`
 - links `linktr.ee`
 - links de WhatsApp
-- links `bit.ly`
+
+Encurtadores genericos como `bit.ly`, `cutt.ly` e `tinyurl.com` sao resolvidos antes da conversao para afiliado. Se o destino nao for uma oferta suportada de Mercado Livre, Amazon, Shopee ou AliExpress, o link e removido do repost para nao criar botoes inuteis.
 
 Quando algo e removido, aparece no log:
 
