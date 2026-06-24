@@ -860,7 +860,6 @@ async def process_message(text):
                 print(f"[ALI] {new_url}")
                 if not media.get("image_url"):
                     media = ali_result.get("metadata") or {}
-                    media["link_preview"] = False
                 found = True
             else:
                 print("[~  ] AliExpress nao gerou link afiliado.")
