@@ -4,7 +4,7 @@ import io
 import re
 import httpx
 from urllib.parse import urlparse, urlencode, parse_qs, parse_qsl, urlunparse, urlsplit, urlunsplit
-from telethon import TelegramClient, events
+from telethon import TelegramClient, events, functions
 from telethon.utils import get_peer_id
 from telethon.tl.types import Channel, Chat
 from config import (
@@ -53,7 +53,8 @@ ML_PRODUCT_REGEX = re.compile(
     r'[^"\'>\s]*'
 )
 ML_DOMAINS     = ("mercadolivre.com", "mercadolibre.com", "ml.com.br", "meli.la")
-AMAZON_DOMAINS = ("amazon.com.br", "amazon.com", "amzn.to", "amzn.com")
+AMAZON_DOMAINS = ("amazon.com.br", "amazon.com", "amzn.to", "amzn.com", "link.amazon")
+AMAZON_SHORT_DOMAINS = ("amzn.to", "amzn.com", "link.amazon")
 ML_CREATE_LINK_URL = "https://www.mercadolivre.com.br/affiliate-program/api/v2/affiliates/createLink"
 ML_MEDIA_TIMEOUT = 15
 ML_BAD_PARAMS = {
@@ -82,6 +83,32 @@ def is_ml(url):
 
 def is_amazon(url):
     return any(d in url for d in AMAZON_DOMAINS)
+
+def is_amazon_short_url(url):
+    host = urlsplit(url).netloc.lower()
+    return any(d in host for d in AMAZON_SHORT_DOMAINS)
+
+def amazon_asin_from_url(url):
+    parsed = urlsplit(url)
+    path_parts = [part for part in parsed.path.split("/") if part]
+
+    for marker in ("dp", "gp/product"):
+        marker_parts = marker.split("/")
+        for index in range(len(path_parts) - len(marker_parts) + 1):
+            if path_parts[index:index + len(marker_parts)] == marker_parts:
+                candidate = path_parts[index + len(marker_parts)]
+                if re.fullmatch(r"[A-Za-z0-9]{10}", candidate):
+                    return candidate.upper()
+
+    if parsed.netloc.lower().endswith("link.amazon") and path_parts:
+        candidate = path_parts[0]
+        if re.fullmatch(r"[A-Za-z0-9]{10}", candidate):
+            return candidate.upper()
+
+    return None
+
+def amazon_product_url_from_asin(asin):
+    return f"https://www.amazon.com.br/dp/{asin}"
 
 def is_promo_group_url(url):
     parsed = urlsplit(url)
@@ -193,6 +220,22 @@ def remove_url_from_text(text, raw_url):
             cleaned_lines.append(cleaned_line)
 
     return re.sub(r"\n{3,}", "\n\n", "\n".join(cleaned_lines)).strip()
+
+def hidden_entity_urls(message):
+    text = message.text or ""
+    entities = message.entities or []
+    urls = []
+
+    for entity in entities:
+        hidden_url = getattr(entity, "url", None)
+        if not hidden_url or hidden_url in text:
+            continue
+
+        urls.append(hidden_url)
+
+    if urls:
+        print(f"[MSG] Links escondidos extraidos: {len(urls)}")
+    return urls
 
 def is_ml_social_url(url):
     return "/social/" in urlsplit(url).path.lower()
@@ -646,12 +689,26 @@ async def fetch_product_metadata(product_url):
 
     return {"title": title, "image_url": image_url}
 
+def image_download_headers(image_url):
+    host = urlsplit(image_url).netloc.lower()
+    if "shopee" in host or "susercontent.com" in host:
+        headers = {
+            **RESOLVE_HEADERS,
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+        }
+        headers["Referer"] = "https://shopee.com.br/"
+        return headers
+    return RESOLVE_HEADERS
+
+def filename_for_image_response(response):
+    return "produto.jpg"
+
 async def download_image_file(image_url):
     try:
         async with httpx.AsyncClient(
             follow_redirects=True,
             timeout=ML_MEDIA_TIMEOUT,
-            headers=RESOLVE_HEADERS,
+            headers=image_download_headers(image_url),
         ) as http:
             response = await http.get(image_url)
             response.raise_for_status()
@@ -660,7 +717,86 @@ async def download_image_file(image_url):
         return None
 
     image_file = io.BytesIO(response.content)
+    image_file.name = filename_for_image_response(response)
+    return image_file
+
+async def download_source_media_file(message, allow_webpage_preview=True):
+    if not getattr(message, "media", None):
+        return None
+
+    webpage = getattr(message.media, "webpage", None)
+    if webpage and not allow_webpage_preview:
+        print("[SRC] Preview original ignorado para nao usar imagem do cupom.")
+        return None
+
+    targets = [message]
+    webpage_photo = getattr(webpage, "photo", None)
+    if webpage_photo and allow_webpage_preview:
+        targets.append(webpage_photo)
+
+    for target in targets:
+        image_file = io.BytesIO()
+        try:
+            downloaded = await client.download_media(target, file=image_file)
+        except Exception as e:
+            print(f"[SRC] Nao consegui baixar midia original: {e}")
+            continue
+
+        if not downloaded or image_file.tell() == 0:
+            continue
+
+        image_file.seek(0)
+        image_file.name = "produto.jpg"
+        print("[SRC] Usando midia original do Telegram como imagem.")
+        return image_file
+
+    return None
+
+async def download_telegram_webpage_preview_file(url):
+    target = None
+
+    try:
+        preview = await client(functions.messages.GetWebPagePreviewRequest(url))
+        webpage = getattr(preview, "webpage", None)
+        target = getattr(webpage, "photo", None) or getattr(webpage, "document", None)
+    except Exception as e:
+        print(f"[SRC] Telegram nao gerou preview direto do segundo link: {e}")
+
+    if not target:
+        temp_message = None
+        try:
+            temp_message = await client.send_message("me", url, link_preview=True)
+            await asyncio.sleep(3)
+            temp_message = await client.get_messages("me", ids=temp_message.id)
+            webpage = getattr(getattr(temp_message, "media", None), "webpage", None)
+            target = getattr(webpage, "photo", None) or getattr(webpage, "document", None)
+        except Exception as e:
+            print(f"[SRC] Telegram nao gerou preview temporario do segundo link: {e}")
+        finally:
+            if temp_message:
+                try:
+                    await client.delete_messages("me", [temp_message.id], revoke=True)
+                except Exception:
+                    pass
+
+    if not target:
+        print("[SRC] Preview do segundo link nao tem foto.")
+        return None
+
+    image_file = io.BytesIO()
+    try:
+        downloaded = await client.download_media(target, file=image_file)
+    except Exception as e:
+        print(f"[SRC] Nao consegui baixar preview do segundo link: {e}")
+        return None
+
+    if not downloaded or image_file.tell() == 0:
+        print("[SRC] Preview do segundo link veio vazio.")
+        return None
+
+    image_file.seek(0)
     image_file.name = "produto.jpg"
+    print("[SRC] Usando preview do segundo link Shopee como imagem.")
     return image_file
 
 async def create_ml_link_once(url):
@@ -780,8 +916,14 @@ async def build_ml_affiliate_result(url):
     }
 
 async def inject_amazon_affiliate(url):
-    if "amzn.to" in url or "amzn.com" in url:
+    if is_amazon_short_url(url):
+        original_url = url
         url = await resolve_redirect(url)
+        if is_amazon_short_url(url):
+            asin = amazon_asin_from_url(url) or amazon_asin_from_url(original_url)
+            if asin:
+                url = amazon_product_url_from_asin(asin)
+                print(f"[AMZ] Short link convertido por ASIN: {url}")
     parsed = urlparse(url)
     params = parse_qs(parsed.query, keep_blank_values=True)
     params.pop("tag", None)
@@ -791,22 +933,34 @@ async def inject_amazon_affiliate(url):
 
 async def build_amazon_affiliate_result(url):
     affiliate_url = await inject_amazon_affiliate(url)
-    metadata = await fetch_amazon_metadata(affiliate_url)
+    metadata = {}
+    if is_amazon_short_url(affiliate_url):
+        print("[AMZ] Link curto nao resolveu para produto; usando fallback de midia original.")
+    else:
+        metadata = await fetch_amazon_metadata(affiliate_url)
     return {
         "affiliate_url": affiliate_url,
         "metadata": metadata,
     }
 
-async def process_message(text):
+async def process_message(text, extra_urls=None):
     text = remove_promo_group_blocks(text)
-    urls = URL_REGEX.findall(text)
-    if not urls:
+    visible_urls = URL_REGEX.findall(text)
+    extra_urls = [
+        raw_url for raw_url in (extra_urls or [])
+        if is_shopee(raw_url.strip(".,)\"'"))
+    ]
+    url_entries = [(raw_url, True) for raw_url in visible_urls]
+    url_entries.extend((raw_url, False) for raw_url in extra_urls)
+    if not url_entries:
         return None
     modified = text
     found = False
     media = {"link_preview": True}
-    for raw_url in urls:
-        if raw_url not in modified:
+    shopee_total = sum(1 for raw, _ in url_entries if is_shopee(raw.strip(".,)\"'")))
+    shopee_seen = 0
+    for raw_url, is_visible_url in url_entries:
+        if is_visible_url and raw_url not in modified:
             continue
 
         url = raw_url.strip(".,)\"'")
@@ -817,7 +971,8 @@ async def process_message(text):
             ml_result = await build_ml_affiliate_result(resolved)
             if ml_result:
                 new_url = ml_result["affiliate_url"]
-                modified = modified.replace(raw_url, new_url)
+                if is_visible_url:
+                    modified = modified.replace(raw_url, new_url)
                 print(f"[ML ] {new_url}")
                 if not media.get("image_url"):
                     media = ml_result.get("metadata") or {}
@@ -825,48 +980,83 @@ async def process_message(text):
                 found = True
             else:
                 print("[~  ] ML nao gerou link afiliado.")
-                modified = remove_url_from_text(modified, raw_url)
+                if is_visible_url:
+                    modified = remove_url_from_text(modified, raw_url)
         elif is_amazon(resolved):
             amazon_result = await build_amazon_affiliate_result(resolved)
             if amazon_result:
                 new_url = amazon_result["affiliate_url"]
-                modified = modified.replace(raw_url, new_url)
+                if is_visible_url:
+                    modified = modified.replace(raw_url, new_url)
                 print(f"[AMZ] {new_url}")
                 if not media.get("image_url"):
                     media = amazon_result.get("metadata") or {}
-                    media["link_preview"] = False
+                    if media.get("image_url"):
+                        media["link_preview"] = False
+                    else:
+                        media["link_preview"] = True
+                        media["source_media_fallback"] = True
+                        media["source_media_allow_webpage"] = True
                 found = True
             else:
                 print("[~  ] Amazon nao gerou link afiliado.")
-                modified = remove_url_from_text(modified, raw_url)
-        elif is_shopee(resolved):
-            shopee_result = await build_shopee_affiliate_result(resolved)
+                if is_visible_url:
+                    modified = remove_url_from_text(modified, raw_url)
+        elif is_shopee(url) or is_shopee(resolved):
+            shopee_seen += 1
+            shopee_source_url = url if is_shopee(url) else resolved
+            use_second_shopee_link_for_media = shopee_total >= 2
+            fetch_shopee_media = (
+                shopee_seen == 2 if use_second_shopee_link_for_media else True
+            )
+            shopee_result = await build_shopee_affiliate_result(
+                shopee_source_url,
+                fetch_metadata=fetch_shopee_media,
+                metadata_from_meta_only=use_second_shopee_link_for_media and shopee_seen == 2,
+            )
             if shopee_result:
                 new_url = shopee_result["affiliate_url"]
-                modified = modified.replace(raw_url, new_url)
+                if is_visible_url:
+                    modified = modified.replace(raw_url, new_url)
                 print(f"[SHP] {new_url}")
-                if not media.get("image_url"):
-                    media = shopee_result.get("metadata") or {}
+                media["link_preview"] = False
+                media["source_media_fallback"] = shopee_total < 2
+                media["source_media_allow_webpage"] = shopee_total < 2
+                if use_second_shopee_link_for_media and shopee_seen == 2:
+                    media["telegram_preview_url"] = shopee_source_url
+                shopee_metadata = shopee_result.get("metadata") or {}
+                if not media.get("image_url") and shopee_metadata.get("image_url"):
+                    telegram_preview_url = media.get("telegram_preview_url")
+                    media = shopee_metadata
                     media["link_preview"] = False
+                    media["source_media_fallback"] = shopee_total < 2
+                    media["source_media_allow_webpage"] = shopee_total < 2
+                    if telegram_preview_url:
+                        media["telegram_preview_url"] = telegram_preview_url
                 found = True
             else:
                 print("[~  ] Shopee nao gerou link afiliado.")
-                modified = remove_url_from_text(modified, raw_url)
+                if is_visible_url:
+                    modified = remove_url_from_text(modified, raw_url)
         elif is_aliexpress(resolved):
             ali_result = await build_aliexpress_affiliate_result(resolved)
             if ali_result:
                 new_url = ali_result["affiliate_url"]
-                modified = modified.replace(raw_url, new_url)
+                if is_visible_url:
+                    modified = modified.replace(raw_url, new_url)
                 print(f"[ALI] {new_url}")
                 if not media.get("image_url"):
                     media = ali_result.get("metadata") or {}
+                    media["link_preview"] = False
                 found = True
             else:
                 print("[~  ] AliExpress nao gerou link afiliado.")
-                modified = remove_url_from_text(modified, raw_url)
+                if is_visible_url:
+                    modified = remove_url_from_text(modified, raw_url)
         else:
             print(f"[~  ] Nao e ML, Amazon, Shopee nem AliExpress. Link removido.")
-            modified = remove_url_from_text(modified, raw_url)
+            if is_visible_url:
+                modified = remove_url_from_text(modified, raw_url)
     if not found:
         return None
 
@@ -914,6 +1104,7 @@ async def handler(event):
     chat_name = getattr(chat, 'title', None) or getattr(chat, 'username', None) or str(chat_id)
 
     text = event.message.text or ""
+    extra_urls = hidden_entity_urls(event.message)
     print(f"[MSG] {chat_name} ({chat_id}): {text[:60]!r}")
 
     if chat_id not in RESOLVED_SOURCE_IDS:
@@ -922,7 +1113,7 @@ async def handler(event):
     if not text:
         return
 
-    result = await process_message(text)
+    result = await process_message(text, extra_urls=extra_urls)
     if result is None:
         print("[~] Sem link afiliado.")
         return
@@ -934,19 +1125,30 @@ async def handler(event):
     result_text = result["text"]
     media = result.get("media") or {}
     image_url = media.get("image_url")
+    image_file = None
 
     if image_url:
         image_file = await download_image_file(image_url)
-        if image_file:
-            await client.send_file(
-                resolved_target,
-                image_file,
-                caption=result_text,
-                link_preview=False,
-                parse_mode="html",
-            )
-            print("[+] Repostado com imagem do produto!")
-            return
+
+    if not image_file and media.get("telegram_preview_url"):
+        image_file = await download_telegram_webpage_preview_file(media["telegram_preview_url"])
+
+    if not image_file and media.get("source_media_fallback"):
+        image_file = await download_source_media_file(
+            event.message,
+            allow_webpage_preview=media.get("source_media_allow_webpage", True),
+        )
+
+    if image_file:
+        await client.send_file(
+            resolved_target,
+            image_file,
+            caption=result_text,
+            link_preview=False,
+            parse_mode="html",
+        )
+        print("[+] Repostado com imagem do produto!")
+        return
 
     await client.send_message(
         resolved_target,
