@@ -2,6 +2,7 @@ services:
   bot:
     build: .
     restart: always
+    init: true
     env_file:
       - .env
     volumes:

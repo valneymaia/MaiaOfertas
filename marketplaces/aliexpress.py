@@ -1,3 +1,5 @@
+"""Integração com o programa de afiliados do AliExpress."""
+
 import asyncio
 import hashlib
 import html

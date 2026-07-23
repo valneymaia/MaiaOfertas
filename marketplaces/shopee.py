@@ -1,3 +1,5 @@
+"""Integração com o programa de afiliados da Shopee."""
+
 import asyncio
 import html
 import re
