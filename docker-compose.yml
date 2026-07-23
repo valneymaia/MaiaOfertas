@@ -1,0 +1,9 @@
+services:
+  bot:
+    build: .
+    restart: always
+    env_file:
+      - .env
+    volumes:
+      - ./affiliate_bot.session:/app/affiliate_bot.session
+      - ./logs:/app/logs

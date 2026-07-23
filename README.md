@@ -120,6 +120,36 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+## Execucao Com Docker
+
+Este projeto ja inclui arquivos de deploy para rodar 24h em uma VPS com Docker.
+
+### Build e subida
+
+```bash
+docker compose up -d --build
+```
+
+Se a sua instalacao usar o binario antigo, o comando equivalente e:
+
+```bash
+docker-compose up -d --build
+```
+
+### O que fica persistido
+
+- A sessao autenticada do Telethon e montada em `affiliate_bot.session` fora da imagem.
+- A pasta `logs/` fica montada para manter os arquivos de log entre reinicios.
+- As variaveis sensiveis continuam vindo do arquivo `.env` via `env_file`.
+
+### Parada e reinicio
+
+```bash
+docker compose stop
+docker compose start
+docker compose logs -f
+```
+
 ## Configuracao
 
 Crie um arquivo `.env` com base no `.env.example`.

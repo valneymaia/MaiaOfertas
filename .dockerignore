@@ -1,0 +1,8 @@
+.venv
+__pycache__
+.git
+.env
+*.log
+logs
+*.session
+*.session-journal
